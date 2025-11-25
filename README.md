@@ -1,1 +1,0 @@
-# Quiz-for-Competitive-Exam-
