@@ -1,8 +1,8 @@
-name: Deploy Vite App to GitHub Pages
+name: Deploy Vite React App to GitHub Pages (auto-detect)
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
@@ -11,43 +11,109 @@ permissions:
   id-token: write
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show repo files (debug)
+      - name: Detect project directory (first package.json)
+        id: detect
         run: |
-          echo "=== repo root listing ==="
-          ls -la
-          echo "=== display subfolders ==="
-          for d in *; do echo "---- $d ----"; ls -la "$d" || true; done
+          # find the first package.json (search depth 4), ignore node_modules
+          proj=$(find . -path './node_modules' -prune -o -type f -name package.json -print | sed -n '1p' || true)
+          if [ -z "$proj" ]; then
+            echo "No package.json found in repository. Aborting."
+            exit 1
+          fi
+          proj_dir=$(dirname "$proj")
+          # normalize '.' for root
+          if [ "$proj_dir" = "." ]; then proj_dir="."; fi
+          echo "Detected project_dir=$proj_dir"
+          echo "project_dir=$proj_dir" >> $GITHUB_OUTPUT
 
-      - name: Setup Node
+      - name: Show detected files (debug)
+        run: |
+          echo "Repository root listing:"
+          ls -la
+          echo "Project directory: ${{ steps.detect.outputs.project_dir }}"
+          echo "Listing project dir:"
+          ls -la "${{ steps.detect.outputs.project_dir }}"
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      - name: Install dependencies
-        run: npm ci
-        working-directory: ./Quiz-for-Competitive-Exam
+      - name: Ensure package.json is readable (debug)
+        run: |
+          echo "---- package.json (project dir) ----"
+          cat "${{ steps.detect.outputs.project_dir }}/package.json" || true
 
-      - name: Build
-        run: npm run build
-        working-directory: ./Quiz-for-Competitive-Exam
+      - name: Ensure vite.config.js exists (create if missing) with Pages base
+        run: |
+          PROJ="${{ steps.detect.outputs.project_dir }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          if [ -f "$PROJ/vite.config.js" ] || [ -f "$PROJ/vite.config.mjs" ] || [ -f "$PROJ/vite.config.ts" ]; then
+            echo "vite.config exists, preserving it."
+          else
+            echo "Creating vite.config.js with base '/${REPO_NAME}/' for GitHub Pages."
+            cat > "$PROJ/vite.config.js" <<'EOF'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+export default defineConfig({
+  base: '/${REPO_NAME}/',
+  plugins: [react()]
+})
+EOF
+            # Replace placeholder ${REPO_NAME} with actual repo name
+            sed -i "s|\${REPO_NAME}|${REPO_NAME}|g" "$PROJ/vite.config.js"
+            echo "Created $PROJ/vite.config.js"
+            echo "Contents:"
+            sed -n '1,200p' "$PROJ/vite.config.js"
+          fi
 
-      - name: Show dist folder
-        run: ls -la Quiz-for-Competitive-Exam/dist || true
+      - name: Install dependencies (try npm ci, fallback to npm install)
+        working-directory: ${{ steps.detect.outputs.project_dir }}
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then
+            echo "Using npm ci (package-lock.json present)"
+            npm ci --no-audit --prefer-offline || (echo "npm ci failed, will try npm install" && npm install)
+          else
+            echo "No package-lock.json; running npm install"
+            npm install --legacy-peer-deps || npm install
+          fi
 
-      - name: Upload Artifact
+      - name: Build the project
+        working-directory: ${{ steps.detect.outputs.project_dir }}
+        run: |
+          echo "NODE = $(node --version)"
+          echo "NPM = $(npm --version)"
+          echo "Running build..."
+          npm run build --if-present
+
+      - name: Show dist contents (debug)
+        run: |
+          PROJ="${{ steps.detect.outputs.project_dir }}"
+          if [ -d "$PROJ/dist" ]; then
+            echo "dist exists. Listing:"
+            ls -la "$PROJ/dist"
+          else
+            echo "No dist directory found at $PROJ/dist"
+            echo "Build likely failed. Dumping project dir for debugging:"
+            ls -la "$PROJ"
+            exit 1
+          fi
+
+      - name: Upload artifact for Pages
         uses: actions/upload-pages-artifact@v3
         with:
-          path: Quiz-for-Competitive-Exam/dist
+          path: ${{ steps.detect.outputs.project_dir }}/dist
 
   deploy:
-    needs: build
+    needs: build-and-deploy
     runs-on: ubuntu-latest
     environment:
       name: github-pages
